@@ -1,0 +1,1664 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head>
+  <meta http-equiv="Content-type" content="text/html;charset=UTF-8" />
+  <title>Automated Panorama Stitching</title> 
+  <!-- <script src="gray.js" type="text/javascript"></script>
+  <script src="blur.js" type="text/javascript"></script>
+  <script src="pyramid.js" type="text/javascript"></script>
+  <script src="keypoint.js" type="text/javascript"></script>
+  <script src="harris.js" type="text/javascript"></script>
+  <script src="descriptor.js" type="text/javascript"></script>
+  <script src="match.js" type="text/javascript"></script>
+  <script src="transform.js" type="text/javascript"></script>
+  <script src="stitch.js" type="text/javascript"></script>
+  <script src="display.js" type="text/javascript"></script>
+  <script src="panorama.js" type="text/javascript"></script> -->
+  <script type="text/javascript">
+
+
+
+var images = [];
+var pyramidLevels = 1;//1;
+var detectorThreshold = 0.0005;//0.001;
+var keyPointCount = 500;
+var matchMinDist = 0.001;//0.0001;
+var ransacIterations = 55000;//1500
+var minInliers = 25//25;
+var inlierRatio = 0.78;//0.6;
+var subpixel = true;
+
+/////****************image.js****************//////////start
+function ImageData()
+{
+  this.img = {}; //image pixel data
+  this.pyramid = [];
+  this.keyPts = [];
+  this.features = [];
+  this.matches = [];
+  this.matchResult = [];
+  this.matchId = -1;
+  this.matchedImages = [];
+  this.transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+}
+/////****************image.js*****************///////end
+ 
+///////****************keypoint.js****************//////////start 
+function KeyPoint(x, y, level, response, radius)
+{
+  this.x = x;
+  this.y = y;
+  this.level = level;
+  this.response = response;
+  this.radius = radius;
+}
+///////****************keypoint.js****************//////////end 
+
+
+
+
+
+/////****************transform.js****************//////////start
+function matMult3(A, B)
+{
+  var C = new Array(9);
+  C[0] = A[0]*B[0]+A[1]*B[3]+A[2]*B[6]; C[1] = A[0]*B[1]+A[1]*B[4]+A[2]*B[7]; C[2] = A[0]*B[2]+A[1]*B[5]+A[2]*B[8];
+  C[3] = A[3]*B[0]+A[4]*B[3]+A[5]*B[6]; C[4] = A[3]*B[1]+A[4]*B[4]+A[5]*B[7]; C[5] = A[3]*B[2]+A[4]*B[5]+A[5]*B[8];
+  C[6] = A[6]*B[0]+A[7]*B[3]+A[8]*B[6]; C[7] = A[6]*B[1]+A[7]*B[4]+A[8]*B[7]; C[8] = A[6]*B[2]+A[7]*B[5]+A[8]*B[8];
+  return C;
+}
+
+function matVecMult3(A, v)
+{
+  var u = [ A[0]*v[0]+A[1]*v[1]+A[2]*v[2],
+            A[3]*v[0]+A[4]*v[1]+A[5]*v[2],
+            A[6]*v[0]+A[7]*v[1]+A[8]*v[2] ];
+  return u;
+}
+
+// finds a homography between 2 quads
+// x1 = H*x2
+// x1 = [src.x;src.y;1] 
+// x2 = [dst.x;dst.y;1] 
+//
+// src: vector with 4 2D points
+// dst: vector with 4 2D points
+function findHomography3(src, dst)
+{
+  //find a homography from unit square to dst;
+  var Hunit_dst = solveHomographyUnitSquare(dst);
+  //find a homography from dst to unit square
+  var Hdst_unit = invertHomography3(Hunit_dst);
+  //find a homography from unit square to src;
+  var Hunit_src = solveHomographyUnitSquare(src);
+  
+  if (Hunit_dst[8]===0.0 || (!Hdst_unit || !Hdst_unit.length) || Hunit_src[8]===0.0)
+  { //invalid
+    var H = [0,0,0,0,0,0,0,0,0];
+    return H;
+  }
+    
+  //compose and normalize
+  var H = matMult3(Hunit_src,Hdst_unit);
+  H[0] /= H[8]; H[1] /= H[8]; H[2] /= H[8]; 
+  H[3] /= H[8]; H[4] /= H[8]; H[5] /= H[8]; 
+  H[6] /= H[8]; H[7] /= H[8]; H[8] /= H[8]; 
+
+  return H;
+}
+  
+//finds an homography between a unit square and the 4 given points
+function solveHomographyUnitSquare(pts)
+{
+  var N = pts.length/2;
+  if (N!==4) 
+  {
+    return null;
+  }
+
+  var x0 = pts[0], y0 = pts[1];
+  var x1 = pts[2], y1 = pts[3];
+  var x2 = pts[4], y2 = pts[5];
+  var x3 = pts[6], y3 = pts[7];
+
+  var dx1 = x1-x2, dy1 = y1-y2;
+  var dx2 = x3-x2, dy2 = y3-y2;
+  var Sx = x0-x1+x2-x3, Sy = y0-y1+y2-y3;
+
+  var a,b,c,d,e,f,g,h;
+  if (Sx===0.0 && Sy===0.0) 
+  { //affine
+    a = x1-x0; d = y1-y0;
+    b = x2-x1; e = y2-y1;
+    c = x0; f = y0;
+    g = 0; h = 0;
+  }
+  else 
+  { //projective
+    var det = dx1*dy2-dx2*dy1;
+    if (det!==0.0) 
+    {
+      g = (Sx*dy2-Sy*dx2)/det;
+      h = (dx1*Sy-dy1*Sx)/det;
+      a = x1-x0+g*x1; d = y1-y0+g*y1;
+      b = x3-x0+h*x3; e = y3-y0+h*y3;
+      c = x0; f = y0;
+    }
+    else 
+    {
+      var H = [0,0,0,0,0,0,0,0,0];
+      return H;
+    }
+  }
+  var H = [a,b,c,d,e,f,g,h,1];
+  return H;
+}
+  
+// Inverts a 3x3 homography
+function invertHomography3(H)
+{
+  if (H.length!==9)
+  {
+    return null;
+  }
+
+  var a,b,c,d,e,f,g,h,i;
+  a = H[0]; b = H[1]; c = H[2];
+  d = H[3]; e = H[4]; f = H[5];
+  g = H[6]; h = H[7]; i = H[8]; 
+      
+  var s = a*e-b*d;
+  if (s===0.0) 
+  {
+    s = 1.0;
+  }
+  
+  var Hinv = [ (e*i-f*h)/s, (c*h-b*i)/s, (b*f-c*e)/s,
+               (f*g-d*i)/s, (a*i-c*g)/s, (c*d-a*f)/s,
+               (d*h-e*g)/s, (b*g-a*h)/s, (a*e-b*d)/s ];
+  return Hinv;
+}
+
+// Compute a homography from the matches using RanSaC
+function computeTransformation(keyPts1, keyPts2, matches, iterations)
+{
+  if (keyPts1===null || keyPts2===null || matches===null || iterations<=0)
+  {
+    return null;
+  }
+
+  var result = {};
+  result.transform = [0,0,0,0,0,0,0,0,0];
+  result.outliers = matches.length;
+  result.inliers = 0;
+
+  var N = matches.length/2;
+  if (N<4)
+  { //not enough matches
+    return result;
+  }
+
+  if (N===4)
+  { //do not iterate
+    
+    //compute homography
+    var src = [], dst = [];
+    for (var j=0; j<4; j++) 
+    {
+      var kp0 = keyPts1[matches[2*j]];
+      src.push(kp0.x);
+      src.push(kp0.y);
+          
+      var kp1 = keyPts2[matches[2*j+1]];
+      dst.push(kp1.x);
+      dst.push(kp1.y);
+    }
+
+    result.transform = findHomography3(src, dst);
+    result.outliers = 0;
+    result.inliers = matches.length - result.outliers;
+    return result;
+  }
+
+  var m = [];
+
+  for (var i=0; i<iterations; i++) 
+  {
+    //select 4 points
+    for (var j=0; j<4; j++) 
+    {
+      m[j] = Math.floor(Math.random() * N);
+      for (var k=0; k<j; k++) 
+      {
+        if (m[j]===m[k]) 
+        {
+          j--;
+          break;
+        }
+      }
+    }
+     
+    //compute homography
+    var src = [], dst = [];
+    for (var j=0; j<4; j++) 
+    {
+      var p0 =  matches[2*m[j]];
+      var kp0 = keyPts1[p0];
+      src.push(kp0.x);
+      src.push(kp0.y);
+          
+      var p1 = matches[2*m[j]+1];
+      var kp1 = keyPts2[p1];
+      dst.push(kp1.x);
+      dst.push(kp1.y);
+    }
+    var H = findHomography3(src, dst);
+    if (H[8]===0.0)
+    { //invalid
+      continue;
+    }
+        
+    //count outliers
+    var outliers = 0;
+    for (var j=0; j<N; j++) 
+    {
+      var p0 = matches[2*j];
+      var kp0 = keyPts1[p0];
+          
+      var p1 = matches[2*j+1];
+      var kp1 = keyPts2[p1];
+
+      var p =[kp1.x, kp1.y, 1];
+      var q = matVecMult3(H,p);
+      q[0] /= q[2];
+      q[1] /= q[2];
+          
+      var err = (q[0]-kp0.x)*(q[0]-kp0.x) + (q[1]-kp0.y)*(q[1]-kp0.y);
+      if (err>1.0) 
+      {
+        outliers++;
+      }
+    }
+    if (outliers>0) //TODO: I don't trust zero outliers!
+    if (outliers<result.outliers) 
+    {
+      result.transform = H;
+      result.outliers = outliers;
+      result.inliers = matches.length - result.outliers;
+    }
+  }
+
+  console.log(" outliers "+result.outliers+" inliers "+result.inliers);
+  return result;
+}
+/////****************transform.js****************//////////end
+
+
+
+/////****************stitch.js****************//////////start
+ function stitchImages(images, context, transform) 
+{
+  if (images===null || context===null)
+  {
+    return null;
+  }
+
+  if (transform===undefined)
+  {
+    transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+  }
+  
+  var N = images.length;
+  if (N<1)
+  {
+    return null;
+  }
+
+  //image transform
+  var H = new Array(N);
+
+  //find new image dimensions
+  var p0 = [0,0], p1 = [images[0].img.width, images[0].img.height];
+  for (var i=0; i<N; i++)
+  {
+    H[i] = matMult3(images[i].transform, transform);
+    
+    //if (images[i].matchedImages.length<1)
+    if (images[i].matchId<0)
+    { //unmatched image
+      continue;
+    }
+    
+    //inverse transform
+    var Hinv = invertHomography3(H[i]);
+
+    var width = images[i].img.width;
+    var height = images[i].img.height;
+    var px = [0.0, 0.0, 1.0];
+    var p;
+    
+    //corner0
+    px[0] = 0.0; px[1] = 0.0; 
+    p = matVecMult3(Hinv, px);
+    p[0] = p[0]/p[2]; p[1] = p[1]/p[2]; 
+    if (p[0]<p0[0]) {p0[0] = p[0];} if (p[1]<p0[1]) {p0[1] = p[1];}
+    if (p[0]>p1[0]) {p1[0] = p[0];} if (p[1]>p1[1]) {p1[1] = p[1];} 
+
+    //corner1
+    px[0] = width; px[1] = 0.0; 
+    p = matVecMult3(Hinv, px);
+    p[0] = p[0]/p[2]; p[1] = p[1]/p[2]; 
+    if (p[0]<p0[0]) {p0[0] = p[0];} if (p[1]<p0[1]) {p0[1] = p[1];}
+    if (p[0]>p1[0]) {p1[0] = p[0];} if (p[1]>p1[1]) {p1[1] = p[1];}
+
+    //corner2
+    px[0] = width; px[1] = height; 
+    p = matVecMult3(Hinv, px); 
+    p[0] = p[0]/p[2]; p[1] = p[1]/p[2]; 
+    if (p[0]<p0[0]) {p0[0] = p[0];} if (p[1]<p0[1]) {p0[1] = p[1];}
+    if (p[0]>p1[0]) {p1[0] = p[0];} if (p[1]>p1[1]) {p1[1] = p[1];}
+
+    //corner3
+    px[0] = 0; px[1] = height; 
+    p = matVecMult3(Hinv, px);
+    p[0] = p[0]/p[2]; p[1] = p[1]/p[2]; 
+    if (p[0]<p0[0]) {p0[0] = p[0];} if (p[1]<p0[1]) {p0[1] = p[1];}
+    if (p[0]>p1[0]) {p1[0] = p[0];} if (p[1]>p1[1]) {p1[1] = p[1];}
+  }
+  
+  var newSize = [ Math.floor(p1[0]-p0[0]), Math.floor(p1[1]-p0[1]) ];
+  console.log("new size w="+newSize[0]+" h="+newSize[1]);
+  
+  //translation
+  var T = p0;
+
+  //Make and fill panorama
+  var dstImg = context.createImageData(newSize[0], newSize[1]);
+  console.log('stitchImages dstImg:'+dstImg)
+  var width  = dstImg.width;
+  var height = dstImg.height;
+  var data = dstImg.data;
+  
+  for (var h=0; h<height; h++) 
+  {
+    for(var w=0; w<width; w++) 
+    {
+      var p = [w+T[0], h+T[1], 1.0];
+      var r = 0, g = 0, b = 0, n = 0;
+      for (var i=0; i<N; i++)
+      {
+        if (images[i].matchId<0)
+        { //unmatched image
+          continue;
+        }
+  
+        var q = matVecMult3(H[i], p);
+        q[0] /= q[2];
+        q[1] /= q[2];
+        
+        var x = Math.floor(q[0]);
+        var y = Math.floor(q[1]);
+        
+        if (x>=0 && x<images[i].img.width && y>=0 && y<images[i].img.height)
+        {
+          var index = (4*y) * images[i].img.width + (4*x);
+          r += images[i].img.data[index+0];
+          g += images[i].img.data[index+1];
+          b += images[i].img.data[index+2];
+          n++;
+        }
+      }
+      if (n>0)
+      {
+        r /= n;
+        g /= n;
+        b /= n;
+      }
+    
+      var index = (4*h) * width + (4*w);
+      data[index+0] = r;
+      data[index+1] = g;
+      data[index+2] = b;
+      data[index+3] = 255;
+    }
+  }
+  dstImg.data = data;
+  console.log('stitchImages return data:'+data);
+  return dstImg;
+}
+/////****************stitch.js****************//////////end
+
+
+/////****************pyramid.js****************//////////start
+function makePyramid(srcImg, context, levels)
+{
+  console.log('makePyramid started')
+  if (srcImg===null || context===null || levels<0)
+  {
+    return null;
+  }
+
+  var pyramid = new Array(levels+1);
+  pyramid[0] = srcImg;
+  for (var i=1; i<=levels; i++)
+  {
+    pyramid[i] = makePyramidLevel(pyramid[i-1], context);
+  }
+  return pyramid;
+}
+
+function makePyramidLevel(srcImg, context)
+{
+    if (srcImg===null || context===null)
+    {
+        return null;
+    }
+  
+    var width = srcImg.width;
+    var height = srcImg.height;
+    var newWidth = width/2;
+    var newHeight = height/2;
+
+    var dstImg = context.createImageData(newWidth, newHeight);
+    var tmpImg = context.createImageData(newWidth, height);
+    
+    var kernel = [1,4,6,4,1];
+
+    //resize horizontal
+    for (var h=0; h<height; h++) 
+    {
+        for (var w=0; w<width; w+=2) 
+        {
+            var r = 0; 
+            var g = 0; 
+            var b = 0;
+            var weight = 0;
+
+            for (var i=0; i<5; i++) 
+            {
+                var k = w+i-2;
+                if (k>=0 && k<width)
+                {
+                    var index = (4*h)*width+(4*k);
+
+                    r += kernel[i]*srcImg.data[index+0];
+                    g += kernel[i]*srcImg.data[index+1];
+                    b += kernel[i]*srcImg.data[index+2];
+                    weight += kernel[i];
+                }
+            }
+          
+            r = (r/weight)&0xff;
+            g = (g/weight)&0xff;
+            b = (b/weight)&0xff;
+
+            // set new pixel value
+            var index = (4*h)*newWidth+(2*w);
+            tmpImg.data[index+0] = r;
+            tmpImg.data[index+1] = g;
+            tmpImg.data[index+2] = b;
+            tmpImg.data[index+3] = 255;
+        }
+    }
+    
+    //resize vertical
+    for (var h=0; h<height; h+=2) 
+    {
+        for (var w=0; w<newWidth; w++) 
+        {
+            var r = 0; 
+            var g = 0; 
+            var b = 0;
+            var weight = 0;
+
+            for (var i=0; i<5; i++) 
+            {
+                var k = h+i-2;
+                if (k>=0 && k<height)
+                {
+                    var index = (4*k)*newWidth+(4*w);
+
+                    r += kernel[i]*tmpImg.data[index+0];
+                    g += kernel[i]*tmpImg.data[index+1];
+                    b += kernel[i]*tmpImg.data[index+2];
+                    weight += kernel[i];
+                }
+            }
+          
+            r = (r/weight)&0xff;
+            g = (g/weight)&0xff;
+            b = (b/weight)&0xff;
+
+            // set new pixel value
+            var index = (2*h)*newWidth+(4*w);
+            dstImg.data[index+0] = r;
+            dstImg.data[index+1] = g;
+            dstImg.data[index+2] = b;
+            dstImg.data[index+3] = 255;
+        }
+    }
+
+    console.log('makePyramidLevel dstImg:');console.log(dstImg)
+    return dstImg;
+}
+/////****************pyramid.js****************//////////end
+
+
+ 
+/////****************panorama.js****************//////////start 
+
+  
+function debug(msg)
+{
+  // var debugTag = document.getElementById("debug");
+  // if (debugTag!==null)
+  // {
+  //   debugTag.innerHTML += "<p>"+msg+"</p>";
+  // }
+  console.log('debug: '+msg)
+}
+
+function showInfo(msg, id)
+{
+  if (id!==undefined)
+  { //image related ouput
+    // var divInfo = document.getElementById("divInfo"+id);
+    // if (divInfo!==null)
+    // {
+    //   divInfo.innerHTML += "<p>"+msg+"</p>";
+    // }
+    console.log('msg:'+msg)
+  }
+}
+
+
+function addImageSection(id)
+{
+  let finddoc=document.getElementById('inputPanoromaImages');
+  if(finddoc){
+    finddoc.parentNode.removeChild(finddoc);
+  }
+
+  let div_m = document.createElement("div");
+  div_m.id='inputPanoromaImages';
+  //div_m.style.visibility='hidden';
+  document.body.appendChild(div_m);
+  console.log('inputPanoromaImages appendChild to DOM')
+
+  var div = document.createElement("div");
+  div.id = "div"+id;
+  var divImg = document.createElement("div");
+  divImg.id = "divImage"+id;
+  divImg.setAttribute("style","float: left");
+  div.appendChild(divImg);
+  var canvas = document.createElement("canvas");
+  canvas.id = "canvas"+id;
+  canvas.style.width = "100%";
+  divImg.appendChild(canvas);
+  var divInfo = document.createElement("div");
+  divInfo.id = "divInfo"+id;
+  divInfo.setAttribute("style","margin-left: 10px; float: left;");
+  div.appendChild(divInfo);
+  var dummyDiv = document.createElement("div");
+  dummyDiv.setAttribute("style","clear: both");
+  div.appendChild(dummyDiv);
+  document.getElementById("inputPanoromaImages").appendChild(div);
+  return canvas;
+}
+
+function processImage(img)
+{ 
+  //add the image to global data
+  let ts=new Date().getTime();
+  console.log('ts processImage started:'+new Date());
+  var id = images.length;
+  images.push(new ImageData());
+  
+  debug("processImage id="+id);
+  
+  //add the image to the document
+  var canvas = addImageSection(id);
+  showInfo("Image Id="+id, id);
+  
+  //draw the image
+  canvas.width = img.width;
+  canvas.height = img.height;
+  var context = canvas.getContext('2d');
+  context.drawImage(img, 0, 0, img.width, img.height);
+  var srcImg = context.getImageData(0, 0, img.width, img.height);
+  images[id].img = srcImg;
+  
+  //make pyramid
+  images[id].pyramid = makePyramid(images[id].img, context, pyramidLevels);
+  
+  //detect keypoints
+  images[id].keyPts = detectPyrKeypoints(images[id].pyramid, context, detectorThreshold, subpixel);
+  showInfo("Keypoint count: "+images[id].keyPts.length, id);
+  
+  //ANMS
+  images[id].keyPts = nonMaxSuppression(images[id].keyPts, keyPointCount);
+  showInfo("Keypoint count (ANMS): "+images[id].keyPts.length, id);
+  
+  //extract descritors
+  images[id].features = extractPyrDescriptors(images[id].pyramid, context, images[id].keyPts);
+  showInfo("Extracted descriptors: "+images[id].features.length, id);
+  
+  //match with previous images
+  for (var i=0; i<id; i++)
+  {
+    images[id].matches[i] = matchFeatures(images[id].features, images[i].features, matchMinDist);
+    showInfo("Match image "+id+" --> "+i+": "+images[id].matches[i].length, id);
+
+    images[id].matchResult[i] = computeTransformation(images[id].keyPts, images[i].keyPts, images[id].matches[i], ransacIterations);
+    showInfo("Ransac outliers "+id+" --> "+i+": "+images[id].matchResult[i].outliers, id);
+    
+    if (images[id].matchResult[i].inliers>=minInliers && images[id].matchResult[i].outliers<inlierRatio*images[id].matchResult[i].inliers)
+    {
+      images[id].matchedImages.push(i);
+      images[i].matchedImages.push(id);
+    }
+  }
+      
+  //compute pair matches
+  matchImages();
+  
+  //draw keypoints
+  var dstImg = drawKeypoints(srcImg, context, images[id].keyPts);
+  context.putImageData(dstImg, 0, 0);
+  
+  //stitch with previous images
+  makePanorama();
+  console.log('processImage done');
+  let ts_=new Date().getTime();
+  let ts_done=ts_-ts;
+  console.log('ts processImage done took:'+ts_done);
+}
+
+function getMatchResult(j, i)
+{
+  if (j<i)
+  {
+    return images[i].matchResult[j];
+  }
+  return images[j].matchResult[i];
+}
+
+function getTransform(j, i)
+{
+  if (j<i)
+  {
+    return images[i].matchResult[j].transform;
+  }
+  return invertHomography3(images[j].matchResult[i].transform);
+}
+
+function matchImages()
+{
+  //reset
+  for (var i=0; i<images.length; i++)
+  {
+    images[i].matchId = -1;
+    images[i].transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+  }
+
+  //search the image with more matches
+  var roots = [0];
+  for (var i=1; i<images.length; i++)
+  {
+    if (images[i].matchedImages.length>images[roots[0]].matchedImages.length)
+    {
+      roots = [i];
+    }
+    else if (images[i].matchedImages.length===images[roots[0]].matchedImages.length)
+    {
+      roots.push(i);
+    }
+  }
+  var root = roots[Math.floor((roots.length-1)/2)];
+
+  if (images[root].matchedImages.length<1)
+  {
+    return;
+  }
+
+  //add images one-by-one
+  var matched = [];
+  var finish = false;
+  images[root].matchId = root;
+  matched.push(root);
+  while (!finish)
+  {
+    finish = true;
+    var id1 = -1;
+    var matchId1 = -1;
+    for (var i=0; i<images.length; i++)
+    {
+      if (matched.indexOf(i)>=0)
+      { //already matched: skip
+        continue;
+      }
+      var matchId2 = -1;
+      for (var j=0; j<matched.length; j++)
+      {
+        var result2 = getMatchResult(matched[j],i);
+        if (result2.inliers>=minInliers && result2.outliers<inlierRatio*result2.inliers)
+        { //candidate
+          if (matchId2<0 || result2.inliers>getMatchResult(matchId2,i).inliers)
+          {
+            matchId2 = matched[j];
+          }
+        }
+      }//for j
+      if (matchId2>=0)
+      { //candidate
+        var result2 = getMatchResult(matchId2,i);
+        if (id1<0 || result2.inliers>getMatchResult(id1,i).inliers)
+        {
+          id1 = i;
+          matchId1 = matchId2;
+        }
+      }
+    }//for i
+    if (id1>=0)
+    { //add
+      images[id1].matchId = matchId1;
+      matched.push(id1);
+      finish = false;
+      showInfo("Matching image Id: "+images[id1].matchId+" (root="+root+")", id1);
+    }
+  }//while
+
+  //update transforms
+  for (var i=0; i<images.length; i++)
+  {
+    images[i].transform = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    var id = i;
+    while (images[id].matchId>=0 && id!==root)
+    {
+      images[i].transform = matMult3(images[i].transform, getTransform(images[id].matchId,id));
+      id = images[id].matchId;
+    }
+  }
+
+}
+
+function makePanorama()
+{
+  console.log(' makePanorama started')
+  //search the root
+  var root = -1;
+  for (var i=0; i<images.length; i++)
+  {
+    if (images[i].matchId===i)
+    {
+      root = i;
+      break;
+    }
+  }
+  if (root<0)
+  { //no match
+    debug("makePanorama: no match");
+    return null;
+  }
+  debug("makePanorama: root="+root);
+  
+  var canvas = document.getElementById("canvasPanorama");
+  if (canvas===null)
+  { //add a canvas element
+    let getpanoramacanvas=document.getElementById("panorama");
+    if(getpanoramacanvas)getpanoramacanvas.parentNode.removeChild(getpanoramacanvas);
+
+    let panoromacanvas=document.createElement("div");
+    panoromacanvas.id="panorama";//panoromacanvas.style.visibility="hidden";
+    document.body.appendChild(panoromacanvas);
+
+    canvas = document.createElement("canvas");
+    canvas.id = "canvasPanorama";
+    document.getElementById("panorama").appendChild(canvas);
+  }
+
+  var context = canvas.getContext('2d');
+  var dstImg = stitchImages(images, context, invertHomography3(images[root].transform));
+  console.log('make panorama:');
+  console.log(dstImg);
+  canvas.width = dstImg.width;
+  canvas.height = dstImg.height;
+  
+ 
+  context.putImageData(dstImg, 0, 0);
+  let base64=canvas.toDataURL("image/jpeg",0.75);
+  console.log(base64);//this is final base64 of all the input images
+}
+ 
+/////****************panorama.js****************//////////end 
+
+
+
+
+///////****************match.js****************//////////start 
+// Match features
+function matchFeatures(features1, features2, minDist)
+{
+  if (features1===null || features2===null || minDist<=0.0)
+  {
+    return null;
+  }
+
+  var matches = [];
+  
+  var matches12 = matchFeaturesSimple(features1, features2, minDist);
+  var matches21 = matchFeaturesSimple(features2, features1, minDist);
+  
+  if (matches12===null || matches21===null)
+  {
+    return null;
+  }
+
+  //cross check
+  for(var m1 in matches12) 
+  {
+    var m2 = matches12[m1];
+    var m3 = matches21[m2];
+    if (matches21[m2]==m1) //compare as strings
+    { //matched
+      matches.push(m1);
+      matches.push(m2);
+    }
+  }
+
+  return matches;
+}
+
+//Square Euclidean distance
+function compareDescriptor(f1, f2)
+{
+  var d = 0.0;
+  for (var i=0; i<f1.length && i<f2.length; i++)
+  {
+    var dif = (f1[i]-f2[i])/255.0;
+    d += dif*dif;
+  }
+  return d;
+}
+
+function matchFeaturesSimple(features1, features2, minDist)
+{
+  if (features1===null || features2===null || minDist<=0.0)
+  {
+    return null;
+  }
+
+  var matches = {};
+
+  //brute force
+  var N1 = features1.length;
+  var N2 = features2.length;
+
+  if (N1===0 || N2===0) 
+  {
+    return null;
+  }
+
+  var d1, d2, m1, m2;
+  for (var i=0; i<N1; i++) 
+  {
+    var d = compareDescriptor(features1[i], features2[0]);
+
+    d1 = d; m1 = 0;
+    d2 = d; m2 = 0;
+
+    for (var j=1; j<N2; j++) 
+    {
+      d = compareDescriptor(features1[i], features2[j]);
+
+      if (d<d1) 
+      {
+        d2 = d1;
+        m2 = m1;
+        d1 = d;
+        m1 = j;
+      }
+      else if (d<d2) 
+      {
+        d2 = d;
+        m2 = j;
+      }
+    }
+
+    if (d1<minDist && d1<0.65*d2) 
+    { //matched
+      matches[i] = m1;
+    }
+  }
+  return matches;
+}
+///////****************match.js****************//////////end 
+
+
+
+
+
+/////////****************harris.js****************//////////start 
+function detectPyrKeypoints(pyramid, context, threshold, subpixel)
+{
+  if (pyramid===null)
+  {
+    return null;
+  }
+  if (subpixel===undefined)
+  {
+    subpixel = false;
+  }
+
+  var keyPts = [];
+  for (var i=0; i<pyramid.length; i++)
+  {
+    keyPts = keyPts.concat(detectKeypoints(pyramid[i], context, threshold, i, subpixel));
+  }
+  return keyPts;
+}
+
+//Detect keypoints in srcImg
+function detectKeypoints(srcImg, context, threshold, level, subpixel)
+{
+  if (srcImg===null || context===null || threshold<=0.0)
+  {
+      return null;
+  }
+  if (level===undefined)
+  {
+    level = 0;
+  }
+  if (subpixel===undefined)
+  {
+    subpixel = false;
+  }
+
+  var keyPts = [];
+  var scale = Math.pow(2, level);
+
+  //convert to gray
+  var grayImg = grayImage(srcImg, context);
+  var gradImg = context.createImageData(srcImg);
+  
+  grayImg = blurImage(grayImg, context);
+  
+  var Ix = [], Iy = [];
+  var maxI = 0;
+  var width_ = grayImg.width;
+  var height_ = grayImg.height;
+  for(var h=1; h+1<height_; h++) 
+  {
+    for(var w=1; w+1<width_; w++) 
+    {
+      var x0 = (4*h) * width_ + (4*(w-1));
+      var x1 = (4*h) * width_ + (4*(w+1));
+      var y0 = (4*(h-1)) * width_ + (4*w);
+      var y1 = (4*(h+1)) * width_ + (4*w);
+      
+      var px1 = grayImg.data[x1];
+      var px0 = grayImg.data[x0];
+      var IIx = (grayImg.data[x1]-grayImg.data[x0]);
+      var IIy = (grayImg.data[y1]-grayImg.data[y0]);
+      Ix.push(IIx);
+      Iy.push(IIy);
+      if (IIx>maxI)
+      {
+        maxI = IIx;
+      }
+      if (IIy>maxI)
+      {
+        maxI = IIy;
+      }
+    }
+  }
+
+  var width = grayImg.width;
+  var height = grayImg.height;
+  for(var h=1; h+1<height; h++) 
+  {
+    for(var w=1; w+1<width; w++) 
+    {
+      var indexI = (h-1) * (width-2) + (w-1);
+      var IIx = Ix[indexI]/maxI;
+      var IIy = Iy[indexI]/maxI;
+          
+      var Ixx = IIx*IIx*255.0;
+      var Iyy = IIy*IIy*255.0;
+      var Ixy = IIx*IIy*255.0;
+      
+      var index = (4*h) * width + (4*w);
+      gradImg.data[index+0] = Ixx;
+      gradImg.data[index+1] = Iyy;
+      gradImg.data[index+2] = Ixy;
+      gradImg.data[index+3] = 255;
+    }
+  }
+      
+  //blur
+  gradImg = blurImage(blurImage(gradImg, context), context);
+  
+  //corner scores
+  var score = [];
+
+  for(var h=1; h+1<height; h++) 
+  {
+    for(var w=1; w+1<width; w++) 
+    {
+      var index = (4*h) * width + (4*w);
+      var Ixx = gradImg.data[index+0]/255.0;
+      var Iyy = gradImg.data[index+1]/255.0;
+      var Ixy = gradImg.data[index+2]/255.0;
+          
+      var det = Ixx*Iyy - 2.0*Ixy;
+      var trace = Ixx + Iyy;
+      
+      //Harmonic mean (HM)
+      var R = 0.0;
+      if (trace>0.0)
+      {
+        R = det/trace;
+      }
+      score.push(R);
+      /*if (R>threshold) 
+      {
+        keyPts.push(new KeyPoint(w,h,R,0.0));
+      }*/
+    }
+  }
+
+  //local non-max suppression
+  width = width-2;
+  height = height-2;
+  for(var h=8; h+8<height; h++) 
+  {
+    for(var w=8; w+8<width; w++) 
+    {
+      var index = h*width + w;
+      var R = score[index];
+      if (R>threshold) 
+      { //check the neighbors
+        var r00 = score[(h-1)*width + (w-1)], r01 = score[(h-1)*width + w], r02 = score[(h-1)*width + (w+1)];
+        var r10 = score[ h   *width + (w-1)], r11 = R,                      r12 = score[ h   *width + (w+1)];
+        var r20 = score[(h+1)*width + (w-1)], r21 = score[(h+1)*width + w], r22 = score[(h+1)*width + (w+1)];
+        if (R>r00 && R>r01 && R>r02 && R>r10 && R>r12 && R>r20 && R>r21 && R>r22)
+        {
+          var x = w;
+          var y = h;
+          
+          if (subpixel)
+          { //subpixel
+            var IIx = (r12-r10)/2.0;
+            var IIy = (r21-r01)/2.0;
+            var Ixx = r12-2.0*r11+r10;
+            var Iyy = r21-2.0*r11+r01;
+            var Ixy = (r22-r20-r02+r00)/4.0;
+            var det = Ixx*Iyy-Ixy*Ixy;
+            x = w - (Iyy*IIx - Ixy*IIy)/det;
+            y = h - (Ixx*IIy - Ixy*IIx)/det;
+            if (Math.abs(x-w)*scale>1.0 || Math.abs(y-h)*scale>1.0)
+            {   //not good, skip
+                continue;
+            }
+          }
+
+          keyPts.push(new KeyPoint(x*scale,y*scale,level,R,0.0));
+        }
+      }
+    }
+  }
+
+  //sort by response (descending)
+  keyPts.sort(function(a,b){return (b.response-a.response);});
+
+  return keyPts;
+}
+
+//Adaptive Non-Maximal Suppression (ANMS)
+// filters the current keypoints in keyPts leaving at most "count"
+//   keypoints with maximum response and evenly distributed in the image
+function nonMaxSuppression(keyPts, count)
+{
+  if (keyPts===null || keyPts.length<count)
+  {
+    return keyPts;
+  }
+
+  var cRobust = 0.9;
+
+  //compute the radius
+  for (var i=0; i<keyPts.length; i++) 
+  {
+    if (keyPts[i].radius===0.0) 
+    {
+      keyPts[i].radius = 1e8;
+    }
+  
+    for (var j=i+1; j<keyPts.length; j++) 
+    {
+      if (keyPts[j].radius===0.0) 
+      {
+        keyPts[j].radius = 1e8;
+      }
+  
+      var x = keyPts[i].x-keyPts[j].x;
+      var y = keyPts[i].y-keyPts[j].y;
+      var d = x*x + y*y;
+      if (keyPts[i].response<cRobust*keyPts[j].response) 
+      {
+        if (d<keyPts[i].radius) 
+        {
+          keyPts[i].radius = d;
+        }
+      }
+      else if (keyPts[j].response<cRobust*keyPts[i].response) 
+      {
+        if (d<keyPts[j].radius) 
+        {
+          keyPts[j].radius = d;
+        }
+      }
+    }
+  }
+
+  //sort descending
+  keyPts.sort(function(a,b){return (b.radius-a.radius);});
+
+  return keyPts.slice(0,count);
+}
+///////****************harris.js****************//////////end 
+
+ 
+
+/////////****************gray.js****************//////////start 
+// Convert image to gray scale
+function grayImage(srcImg, context)
+{
+  if (srcImg===null || context===null)
+  {
+      return null;
+  }
+
+  var dstImg = context.createImageData(srcImg);
+  var width  = srcImg.width;
+  var height = srcImg.height;
+    
+  for (var h=0; h<height; h++) 
+  {
+    for (var w=0; w<width; w++) 
+    {
+      var index = (4*h)*width+(4*w);
+      var gray = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      
+      dstImg.data[index+0] = gray;
+      dstImg.data[index+1] = gray;
+      dstImg.data[index+2] = gray;
+      dstImg.data[index+3] = srcImg.data[index+3];
+    }
+  }
+
+  return dstImg;
+}
+/////////****************gray.js****************//////////end 
+
+ 
+
+/////////****************display.js****************//////////start 
+// Display detected keypoints and matches
+function drawKeypoints(srcImg, context, keyPts, r, g, b)
+{
+  if (srcImg===null || context===null || keyPts===null)
+  {
+    return null;
+  }
+  
+  if (r===undefined)
+  { //draw in red
+    r = 255;
+    g = 0;
+    b = 0;
+  }
+
+  var dstImg = context.createImageData(srcImg);
+  dstImg.data.set(srcImg.data);
+    
+  var width  = srcImg.width;
+  var height = srcImg.height;
+  var s = 2;
+      
+  //draw keypoints
+  var N = keyPts.length;
+  for (var i=0; i<N; i++) 
+  {
+    var kp = keyPts[i];
+    var x = Math.floor(kp.x);
+    var y = Math.floor(kp.y);
+    
+    for (var j=-s; j<=s; j++)
+    {
+      if (x+j>=0 && x+j<width) 
+      {
+        var index = (4*y) * width + (4*(x+j));
+        dstImg.data[index+0] = r;
+        dstImg.data[index+1] = g;
+        dstImg.data[index+2] = b;
+        dstImg.data[index+3] = 255;
+      }
+      if (y+j>=0 && y+j<height) 
+      {
+        var index = (4*(y+j)) * width + (4*x);
+        dstImg.data[index+0] = r;
+        dstImg.data[index+1] = g;
+        dstImg.data[index+2] = b;
+        dstImg.data[index+3] = 255;
+      }
+    }
+  }
+  return dstImg;
+}
+/////////****************display.js****************//////////end 
+ 
+
+
+/////////****************descriptor.js****************//////////start 
+function extractPyrDescriptors(pyramid, context, keyPts)
+{
+  if (pyramid===null || context===null || keyPts===null)
+  {
+      return null;
+  }
+
+  var features = [];
+  
+  //blur the image
+  var img = new Array(pyramid.length);
+  for (var i=0; i<pyramid.length; i++) 
+  {
+    img[i] = blurImage(blurImage(pyramid[i], context), context);
+  }
+  
+  //make descriptors
+  for (var i=0; i<keyPts.length; i++) 
+  {
+    var kp = keyPts[i];
+    features.push(makeDescriptor(img[kp.level], context, kp));
+  }
+  
+  return features;
+}
+
+//Extract descriptors from srcImg and locations given by keyPts
+function extractDescriptors(srcImg, context, keyPts)
+{
+  if (srcImg===null || context===null || keyPts===null)
+  {
+      return null;
+  }
+
+  var features = [];
+  
+  //blur the image
+  var img = blurImage(blurImage(srcImg, context), context);
+  
+  //compute the radius
+  for (var i=0; i<keyPts.length; i++) 
+  {
+    features.push(makeDescriptor(img, context, keyPts[i]));
+  }
+  
+  return features;
+}
+
+function makeDescriptor(srcImg, context, keypoint)
+{
+  if (srcImg===null || context===null || keypoint===null)
+  {
+      return null;
+  }
+
+  var feature = [];
+  
+  var width = srcImg.width;
+  var height = srcImg.height;
+  var scale = Math.pow(2.0,keypoint.level);
+  var s = 3;
+  
+  var sum = 0.0;
+  var sum_sqr = 0.0;
+  
+  for (var i=0; i<8; i++)
+  {
+    var x = keypoint.x/scale + ((i-4)*s);
+    var x0 = Math.floor(x);
+    var x1 = x0 + 1;
+    var dx = x-x0;
+    for (var j=0; j<8; j++)
+    { 
+      var y = keypoint.y/scale + ((j-4)*s);
+      
+      /* bilinear */
+      var y0 = Math.floor(y);
+      var y1 = y0 + 1;
+      var dy = y-y0;
+      
+      var p00 = 0, p01 = 0, p10 = 0, p11 = 0;
+      
+      if (x0>=0 && x0<width && y0>=0 && y0<height)
+      {
+        var index = (4*y0)*width+(4*x0);
+        p00 = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      }
+      if (x1>=0 && x1<width && y0>=0 && y0<height)
+      {
+        var index = (4*y0)*width+(4*x1);
+        p01 = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      }
+      if (x0>=0 && x0<width && y1>=0 && y1<height)
+      {
+        var index = (4*y1)*width+(4*x0);
+        p10 = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      }
+      if (x1>=0 && x1<width && y1>=0 && y1<height)
+      {
+        var index = (4*y1)*width+(4*x1);
+        p11 = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      }
+      
+      var p0 = (1.0-dx)*p00 + dx*p01;
+      var p1 = (1.0-dx)*p10 + dx*p11;
+      var p = (1.0-dy)*p0 + dy*p1;
+     
+      /* var p = 0;
+      if (x>=0 && x<width && y>=0 && y<height)
+      {
+        var index = (4*y)*width+(4*x);
+        p = 0.11*srcImg.data[index+0] + 0.59*srcImg.data[index+1] + 0.30*srcImg.data[index+2];
+      }*/
+    
+      feature.push(p);
+      
+      sum += p;
+      sum_sqr += p*p;
+    }
+  }
+
+  //normalize
+  var mean = sum/feature.length;
+  var dev = Math.sqrt((sum_sqr - ((sum*sum)/feature.length))/(feature.length - 1.0));
+  if (dev===0.0)
+  {
+    dev = 1.0;
+  }
+  for (var i=0; i<feature.length; i++)
+  {
+    feature[i] = (feature[i]-mean)/dev;
+  }
+
+  return feature;
+}
+/////////****************descriptor.js****************//////////end 
+
+ 
+/////////****************blur.js****************//////////start 
+// Convolve an image with a Gaussian kernel
+function blurImage(srcImg, context)
+{
+    if (srcImg===null || context===null)
+    {
+        return null;
+    }
+
+    var dstImg = context.createImageData(srcImg);
+    var tmpImg = context.createImageData(dstImg);
+    
+    var kernel = [1,4,6,4,1];
+
+    var width  = srcImg.width;
+    var height = srcImg.height;
+
+    //convolve horizontal
+    for (var h=0; h<height; h++) 
+    {
+        for (var w=0; w<width; w++) 
+        {
+            var r = 0; 
+            var g = 0; 
+            var b = 0;
+            var weight = 0;
+
+            for (var i=0; i<5; i++) 
+            {
+                var k = w+i-2;
+                if (k>=0 && k<width)
+                {
+                    var index = (4*h)*width+(4*k);
+
+                    r += kernel[i]*srcImg.data[index+0];
+                    g += kernel[i]*srcImg.data[index+1];
+                    b += kernel[i]*srcImg.data[index+2];
+                    weight += kernel[i];
+                }
+            }
+          
+            r = (r/weight)&0xff;
+            g = (g/weight)&0xff;
+            b = (b/weight)&0xff;
+
+            // set new pixel value
+            var index = (4*h)*width+(4*w);
+            tmpImg.data[index+0] = r;
+            tmpImg.data[index+1] = g;
+            tmpImg.data[index+2] = b;
+            tmpImg.data[index+3] = 255;
+        }
+    }
+    
+    //convolve vertical
+    for (var h=0; h<height; h++) 
+    {
+        for (var w=0; w<width; w++) 
+        {
+            var r = 0; 
+            var g = 0; 
+            var b = 0;
+            var weight = 0;
+
+            for (var i=0; i<5; i++) 
+            {
+                var k = h+i-2;
+                if (k>=0 && k<height)
+                {
+                    var index = (4*k)*width+(4*w);
+
+                    r += kernel[i]*tmpImg.data[index+0];
+                    g += kernel[i]*tmpImg.data[index+1];
+                    b += kernel[i]*tmpImg.data[index+2];
+                    weight += kernel[i];
+                }
+            }
+          
+            r = (r/weight)&0xff;
+            g = (g/weight)&0xff;
+            b = (b/weight)&0xff;
+
+            // set new pixel value
+            var index = (4*h)*width+(4*w);
+            dstImg.data[index+0] = r;
+            dstImg.data[index+1] = g;
+            dstImg.data[index+2] = b;
+            dstImg.data[index+3] = 255;
+        }
+    }
+
+    return dstImg;
+}
+/////////****************blur.js****************//////////end 
+
+
+
+
+
+
+
+
+
+
+
+
+
+function addImage(src)
+{
+  var img = new Image();
+  img.addEventListener("load", function (){processImage(img);}, false); 
+  img.src = src;
+}
+
+
+function reset()
+{
+  images = [];
+  document.getElementById("panorama").innerHTML = "";
+  document.getElementById("inputPanoromaImages").innerHTML = "";
+ 
+}
+
+//main
+window.onload = function() {
+  // Check for the various File API support.
+  if (window.File && window.FileReader && window.FileList && window.Blob) {
+    // Great success! All the File APIs are supported.
+    console.log('file api init')
+  } else {
+    alert('The File APIs are not fully supported in this browser.');
+  }
+};
+
+
+
+    function addUserImage(files)
+    {
+      var output = [];
+      for (var i=0; i<files.length; i++)
+      {
+        var fileObj = files[i];
+        addImage(window.URL.createObjectURL(fileObj));    
+        output.push('<li><strong>', escape(fileObj.name), '</strong> (', fileObj.type || 'n/a', ') - ', fileObj.size, ' bytes','</li>');
+      }
+      document.getElementById('list').innerHTML += '<ul>' + output.join('') + '</ul>';
+    }
+    function runDemo()
+    {
+      let base64img1="";
+      let base64img2="";
+      let base64img3="";
+      var demoImages = [];
+      demoImages.push(base64img1);
+      demoImages.push(base64img2);
+      demoImages.push(base64img3);
+
+      var output = [];
+      reset();
+      document.getElementById('list').innerHTML = "";
+      document.getElementById('inputFiles').value = "";
+      for (var i=0; i<demoImages.length; i++)
+      {
+        addImage(demoImages[i]);
+        output.push('<li><strong>', escape(demoImages[i]), '</strong></li>');
+      }
+      document.getElementById('list').innerHTML += '<ul>' + output.join('') + '</ul>';
+    }
+    function doReset()
+    {
+      reset();
+      document.getElementById('list').innerHTML = "";
+      document.getElementById('inputFiles').value = "";
+    }
+  </script>
+  <style type="text/css">
+body {
+margin: 0px;
+width: 100%;
+font-family: 'Crimson Text', serif;
+font-size: 20px;
+background: #fcfcfc;
+}
+h1 {
+font-family: 'Nunito', sans-serif;
+font-weight: normal;
+font-size: 28px;
+margin: 25px 0px 0px 0px;
+text-transform: lowercase;
+}
+h2 {
+font-family: 'Nunito', sans-serif;
+font-weight: normal;
+font-size: 32px;
+margin: 15px 0px 35px 0px;
+color: #333; word-spacing: 3px;
+}
+h3 {
+font-family: 'Nunito', sans-serif;
+font-weight: normal;
+font-size: 26px;
+margin: 10px 0px 10px 0px;
+color: #333;
+word-spacing: 2px;
+}
+h4 {
+font-family: 'Nunito', sans-serif;
+font-weight: normal;
+font-size: 22px;
+margin: 10px 0px 10px 0px;
+color: #333;
+word-spacing: 2px;
+}
+h5 {
+font-family: 'Nunito', sans-serif;
+font-weight: normal;
+font-size: 18px;
+margin: 10px 0px 10px 0px;
+color: #111;
+word-spacing: 2px;
+}
+p, li {
+color: #444;
+}
+a {
+color: #DE3737;
+}
+.container {
+margin: 0px 10px 0px 10px;
+}
+#header {
+background: #333;
+width: 100%;
+}
+#headersub {
+color: #ccc;
+margin: 0px 10px 0px 10px;
+padding: 20px 0px 20px 0px;
+}
+  </style></head>
+
+<body>
+<div id="header">
+<div id="headersub">
+<h1>
+ <span style="color: rgb(222, 55, 55);">(damoreno)</span></h1>
+</div>
+</div>
+
+<div class="container">
+<div style="text-align: justify;"></div>
+<h2 style="text-align: justify;">Automated Panorama Stitching</h2>
+<div style="text-align: justify;">Add images one-by-one or several at a time. All the processing is done by the browser and might be slow depending on the image sizes, image count, and browser. The tool is completely written in Javascript and requires HTML5 browser support. I have tested it with Mozilla Firefox and Google Chrome (Chrome seems to be faster).<br>
+
+<p>Add images: <input type="file" id="inputFiles" multiple onchange="javascript:addUserImage(this.files);">
+    &nbsp;or&nbsp;<input type="button" id="demo" value="Demo" onclick="javascript:runDemo();">
+    &nbsp;<input type="button" id="reset" value="Reset" onclick="doReset();"></p>
+ <div id="list" width="100%"></div>
+ <!-- <div id="inputImages" width="100%"></div> -->
+ <div id="panorama" width="100%"></div>
+ <!--
+ <div id="debug" width="100%"></div>
+ -->
+</body></html>
